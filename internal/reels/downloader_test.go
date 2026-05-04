@@ -285,20 +285,26 @@ func TestDownloaderSynthesizesTikTokPhotoCarouselWithAudio(t *testing.T) {
 	if len(calls) != 1 {
 		t.Fatalf("ffmpeg calls = %d, want 1", len(calls))
 	}
-	if strings.Count(calls[0], "-loop 1") != 7 {
-		t.Fatalf("ffmpeg args = %q, want seven image inputs", calls[0])
+	if strings.Count(calls[0], "-loop 1") != 0 {
+		t.Fatalf("ffmpeg args = %q, want carousel images as still inputs", calls[0])
 	}
 	if strings.Contains(calls[0], "xfade=transition=slideleft") {
 		t.Fatalf("ffmpeg args = %q, did not expect xfade", calls[0])
 	}
-	if !strings.Contains(calls[0], "hstack=inputs=7") {
-		t.Fatalf("ffmpeg args = %q, want seven-image strip", calls[0])
+	if !strings.Contains(calls[0], "hstack=inputs=8") {
+		t.Fatalf("ffmpeg args = %q, want seven-image strip with duplicated first image", calls[0])
 	}
 	if !strings.Contains(calls[0], "crop=w=") {
 		t.Fatalf("ffmpeg args = %q, want moving crop viewport", calls[0])
 	}
-	if !strings.Contains(calls[0], "clip((t-23.500)/0.500\\,0\\,1)") {
-		t.Fatalf("ffmpeg args = %q, want final slide motion before remaining time", calls[0])
+	if !strings.Contains(calls[0], "loop=loop=-1:size=1:start=0,trim=duration=45,setpts=N/(6*TB)") {
+		t.Fatalf("ffmpeg args = %q, want static strip looped to output duration", calls[0])
+	}
+	if !strings.Contains(calls[0], "floor(mod(t\\,28)/4)") {
+		t.Fatalf("ffmpeg args = %q, want modulo crop cycle", calls[0])
+	}
+	if !strings.Contains(calls[0], "clip((mod(mod(t\\,28)\\,4)-3.500)/0.500\\,0\\,1)") {
+		t.Fatalf("ffmpeg args = %q, want slide motion near end of each segment", calls[0])
 	}
 	if !strings.Contains(calls[0], "atrim=start=0:duration=45") {
 		t.Fatalf("ffmpeg args = %q, want 45s audio trim", calls[0])
@@ -306,7 +312,7 @@ func TestDownloaderSynthesizesTikTokPhotoCarouselWithAudio(t *testing.T) {
 	if !strings.Contains(calls[0], "-pix_fmt yuv420p") {
 		t.Fatalf("ffmpeg args = %q, want yuv420p output", calls[0])
 	}
-	assertFastPhotoVideoEncoding(t, calls[0], 7, 6)
+	assertFastPhotoVideoEncoding(t, calls[0], 0, 6)
 }
 
 func TestDownloaderSynthesizesTikTokPhotoPostWithAudioOffsetFromMetadata(t *testing.T) {
@@ -1018,20 +1024,26 @@ func TestDownloaderReturnsOnlyVideoForCarouselWithAudio(t *testing.T) {
 	if len(calls) != 1 {
 		t.Fatalf("ffmpeg calls = %d, want 1", len(calls))
 	}
-	if strings.Count(calls[0], "-loop 1") != 2 {
-		t.Fatalf("ffmpeg args = %q, want two image inputs", calls[0])
+	if strings.Count(calls[0], "-loop 1") != 0 {
+		t.Fatalf("ffmpeg args = %q, want carousel images as still inputs", calls[0])
 	}
 	if strings.Contains(calls[0], "xfade=transition=slideleft") {
 		t.Fatalf("ffmpeg args = %q, did not expect xfade", calls[0])
 	}
-	if !strings.Contains(calls[0], "hstack=inputs=2") {
-		t.Fatalf("ffmpeg args = %q, want two-image strip", calls[0])
+	if !strings.Contains(calls[0], "hstack=inputs=3") {
+		t.Fatalf("ffmpeg args = %q, want two-image strip with duplicated first image", calls[0])
 	}
 	if !strings.Contains(calls[0], "crop=w=") {
 		t.Fatalf("ffmpeg args = %q, want moving crop viewport", calls[0])
 	}
-	if !strings.Contains(calls[0], "clip((t-3.500)/0.500\\,0\\,1)") {
-		t.Fatalf("ffmpeg args = %q, want slide motion inside first segment", calls[0])
+	if !strings.Contains(calls[0], "loop=loop=-1:size=1:start=0,trim=duration=90,setpts=N/(6*TB)") {
+		t.Fatalf("ffmpeg args = %q, want static strip looped to output duration", calls[0])
+	}
+	if !strings.Contains(calls[0], "floor(mod(t\\,8)/4)") {
+		t.Fatalf("ffmpeg args = %q, want modulo crop cycle", calls[0])
+	}
+	if !strings.Contains(calls[0], "clip((mod(mod(t\\,8)\\,4)-3.500)/0.500\\,0\\,1)") {
+		t.Fatalf("ffmpeg args = %q, want slide motion near end of each segment", calls[0])
 	}
 	if !strings.Contains(calls[0], "-t 90") {
 		t.Fatalf("ffmpeg args = %q, want 90s output", calls[0])
@@ -1039,7 +1051,7 @@ func TestDownloaderReturnsOnlyVideoForCarouselWithAudio(t *testing.T) {
 	if !strings.Contains(calls[0], "-pix_fmt yuv420p") {
 		t.Fatalf("ffmpeg args = %q, want yuv420p output", calls[0])
 	}
-	assertFastPhotoVideoEncoding(t, calls[0], 2, 6)
+	assertFastPhotoVideoEncoding(t, calls[0], 0, 6)
 }
 
 func TestDownloaderExtendsCarouselVideoWhenAudioIsShort(t *testing.T) {
@@ -1099,17 +1111,23 @@ func TestDownloaderExtendsCarouselVideoWhenAudioIsShort(t *testing.T) {
 	if len(calls) != 1 {
 		t.Fatalf("ffmpeg calls = %d, want 1", len(calls))
 	}
-	if strings.Count(calls[0], "-loop 1") != 4 {
-		t.Fatalf("ffmpeg args = %q, want four image inputs", calls[0])
+	if strings.Count(calls[0], "-loop 1") != 0 {
+		t.Fatalf("ffmpeg args = %q, want carousel images as still inputs", calls[0])
 	}
 	if strings.Contains(calls[0], "xfade=transition=slideleft") {
 		t.Fatalf("ffmpeg args = %q, did not expect xfade", calls[0])
 	}
-	if !strings.Contains(calls[0], "hstack=inputs=4") {
-		t.Fatalf("ffmpeg args = %q, want four-image strip", calls[0])
+	if !strings.Contains(calls[0], "hstack=inputs=5") {
+		t.Fatalf("ffmpeg args = %q, want four-image strip with duplicated first image", calls[0])
 	}
-	if !strings.Contains(calls[0], "clip((t-11.500)/0.500\\,0\\,1)") {
-		t.Fatalf("ffmpeg args = %q, want final slide motion before last image", calls[0])
+	if !strings.Contains(calls[0], "loop=loop=-1:size=1:start=0,trim=duration=16,setpts=N/(6*TB)") {
+		t.Fatalf("ffmpeg args = %q, want static strip looped to output duration", calls[0])
+	}
+	if !strings.Contains(calls[0], "floor(mod(t\\,16)/4)") {
+		t.Fatalf("ffmpeg args = %q, want modulo crop cycle", calls[0])
+	}
+	if !strings.Contains(calls[0], "clip((mod(mod(t\\,16)\\,4)-3.500)/0.500\\,0\\,1)") {
+		t.Fatalf("ffmpeg args = %q, want slide motion near end of each segment", calls[0])
 	}
 	if !strings.Contains(calls[0], "atrim=start=0:duration=5") {
 		t.Fatalf("ffmpeg args = %q, want 5s audio trim", calls[0])
@@ -1123,7 +1141,7 @@ func TestDownloaderExtendsCarouselVideoWhenAudioIsShort(t *testing.T) {
 	if !strings.Contains(calls[0], "-pix_fmt yuv420p") {
 		t.Fatalf("ffmpeg args = %q, want yuv420p output", calls[0])
 	}
-	assertFastPhotoVideoEncoding(t, calls[0], 4, 6)
+	assertFastPhotoVideoEncoding(t, calls[0], 0, 6)
 }
 
 func TestDownloaderReturnsAudioUnavailableForMusicMetadataWithoutAudioURL(t *testing.T) {

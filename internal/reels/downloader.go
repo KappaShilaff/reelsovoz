@@ -1182,12 +1182,16 @@ func (d Downloader) synthesizeSlideshowVideo(ctx context.Context, images [][]byt
 	}
 	frameRate := photoVideoFrameRateForImageCount(len(images))
 	for _, imagePath := range imagePaths {
-		args = append(args,
-			"-framerate", strconv.Itoa(frameRate),
-			"-loop", "1",
-			"-t", ffmpegSeconds(videoDuration),
-			"-i", imagePath,
-		)
+		if len(images) <= 1 {
+			args = append(args,
+				"-framerate", strconv.Itoa(frameRate),
+				"-loop", "1",
+				"-t", ffmpegSeconds(videoDuration),
+				"-i", imagePath,
+			)
+			continue
+		}
+		args = append(args, "-i", imagePath)
 	}
 	args = append(args,
 		"-i", audioPath,
@@ -1255,6 +1259,10 @@ func slideshowFilterComplex(imageCount int, audioStart time.Duration, audioDurat
 		if i > 0 {
 			filter.WriteString(";")
 		}
+		if i == 0 {
+			filter.WriteString(fmt.Sprintf("[%d:v]scale=w=min(%d\\,iw):h=min(%d\\,ih):force_original_aspect_ratio=decrease:force_divisible_by=2:out_range=tv,pad=%d:%d:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p,split=2[v0][v%d]", i, width, height, width, height, imageCount))
+			continue
+		}
 		filter.WriteString(fmt.Sprintf("[%d:v]scale=w=min(%d\\,iw):h=min(%d\\,ih):force_original_aspect_ratio=decrease:force_divisible_by=2:out_range=tv,pad=%d:%d:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p[v%d]", i, width, height, width, height, i))
 	}
 
@@ -1262,9 +1270,10 @@ func slideshowFilterComplex(imageCount int, audioStart time.Duration, audioDurat
 	for i := 0; i < imageCount; i++ {
 		filter.WriteString(fmt.Sprintf("[v%d]", i))
 	}
-	filter.WriteString(fmt.Sprintf("hstack=inputs=%d[strip]", imageCount))
+	filter.WriteString(fmt.Sprintf("[v%d]", imageCount))
+	filter.WriteString(fmt.Sprintf("hstack=inputs=%d[strip]", imageCount+1))
 	filter.WriteString(";")
-	filter.WriteString(fmt.Sprintf("[strip]crop=w=%d:h=%d:x='%s':y=0,scale=out_range=tv,format=yuv420p[vout]", width, height, slideshowCropExpression(width, videoDuration, imageCount)))
+	filter.WriteString(fmt.Sprintf("[strip]loop=loop=-1:size=1:start=0,trim=duration=%s,setpts=N/(%d*TB),crop=w=%d:h=%d:x='%s':y=0,scale=out_range=tv,format=yuv420p[vout]", ffmpegSeconds(videoDuration), photoVideoFrameRate, width, height, slideshowCropExpression(width, imageCount)))
 	filter.WriteString(";")
 	filter.WriteString(audioFilter)
 	return filter.String()
@@ -1287,21 +1296,23 @@ func audioLoopSamples(duration time.Duration) int64 {
 	return samples
 }
 
-func slideshowCropExpression(width int, total time.Duration, imageCount int) string {
+func slideshowCropExpression(width int, imageCount int) string {
 	if imageCount <= 1 || width <= 0 {
 		return "0"
 	}
-	segments := slideshowSegmentDurations(total, imageCount)
-	var parts []string
-	offset := time.Duration(0)
-	for i := 0; i < imageCount-1; i++ {
-		segment := segments[i]
-		transition := minDuration(photoSlideTransition, segment)
-		start := offset + segment - transition
-		parts = append(parts, fmt.Sprintf("clip((t-%s)/%s\\,0\\,1)", ffmpegSeconds(start), ffmpegSeconds(transition)))
-		offset += segment
-	}
-	return fmt.Sprintf("%d*(%s)", width, strings.Join(parts, "+"))
+	transition := minDuration(photoSlideTransition, photoSlideDuration)
+	hold := photoSlideDuration - transition
+	cycle := time.Duration(imageCount) * photoSlideDuration
+	return fmt.Sprintf(
+		"%d*(floor(mod(t\\,%s)/%s)+clip((mod(mod(t\\,%s)\\,%s)-%s)/%s\\,0\\,1))",
+		width,
+		ffmpegSeconds(cycle),
+		ffmpegSeconds(photoSlideDuration),
+		ffmpegSeconds(cycle),
+		ffmpegSeconds(photoSlideDuration),
+		ffmpegSeconds(hold),
+		ffmpegSeconds(transition),
+	)
 }
 
 func slideshowVideoDuration(audioDuration time.Duration, imageCount int) time.Duration {
@@ -1316,28 +1327,6 @@ func slideshowVideoDuration(audioDuration time.Duration, imageCount int) time.Du
 		return minimum
 	}
 	return audioDuration
-}
-
-func slideshowSegmentDurations(total time.Duration, imageCount int) []time.Duration {
-	if imageCount <= 0 {
-		return nil
-	}
-	if imageCount == 1 {
-		return []time.Duration{total}
-	}
-	if total <= 0 {
-		total = time.Duration(imageCount) * photoSlideDuration
-	}
-	segments := make([]time.Duration, imageCount)
-	for i := 0; i < imageCount-1; i++ {
-		segments[i] = photoSlideDuration
-	}
-	last := total - time.Duration(imageCount-1)*photoSlideDuration
-	if last < photoSlideDuration {
-		last = photoSlideDuration
-	}
-	segments[imageCount-1] = last
-	return segments
 }
 
 func extractInstagramImageURLs(page string) []string {
