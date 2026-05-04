@@ -1,0 +1,16 @@
+.git
+.gitignore
+.dockerignore
+.env
+.env.*
+!.env.example
+.local
+.venv
+test-output
+*.mp4
+Dockerfile
+docker-compose.yml
+README.md
+**/.DS_Store
+**/.idea
+**/.vscode
