@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -26,11 +27,24 @@ type InlineHandler struct {
 	UploadRetries   int
 	UploadTimeout   time.Duration
 	RunBackground   func(func())
+	Metrics         MetricsRecorder
 }
 
 type Logger interface {
 	Error(msg string, args ...any)
 	Info(msg string, args ...any)
+}
+
+type MetricsRecorder interface {
+	IncStartCommand(result string)
+	IncInlineQuery(result string, platform string)
+	IncInlineChosen(result string, kind string, source string, platform string)
+	ObserveDownload(platform string, status string, duration time.Duration)
+	IncDownloadedMedia(platform string, kind string)
+	ObserveDownloadedMediaSize(platform string, kind string, sizeBytes int)
+	ObserveStorageUpload(kind string, status string, duration time.Duration)
+	ObserveStorageUploadSize(kind string, sizeBytes int)
+	IncInlineMediaSent(kind string, source string, status string)
 }
 
 type InlineQuery struct {
@@ -55,11 +69,14 @@ type StartCommand struct {
 func (h InlineHandler) Handle(ctx context.Context, query InlineQuery) error {
 	reelURL, err := reels.ExtractURL(strings.TrimSpace(query.Query))
 	if err != nil {
+		h.recordInlineQuery("usage", "unknown")
 		return h.answerUsage(ctx, query.ID)
 	}
 	reelURL = withDefaultScheme(reelURL)
+	platform := sourcePlatform(reelURL)
 	storageChatID, ok := h.storageChatIDForUser(query.FromUserID)
 	if !ok {
+		h.recordInlineQuery("start_required", platform)
 		return h.answerStartRequired(ctx, query.ID)
 	}
 	cacheKey := h.mediaCacheKeyForUser(reelURL, query.FromUserID)
@@ -69,6 +86,7 @@ func (h InlineHandler) Handle(ctx context.Context, query InlineQuery) error {
 	}
 	if cached, ok := cache.Get(cacheKey); ok {
 		h.logInfo("inline media cache hit", reelURL, "items", len(cached))
+		h.recordInlineQuery("cache_hit", platform)
 		return h.answerCachedMedia(ctx, query.ID, cached)
 	}
 	h.logInfo("inline media cache miss", reelURL)
@@ -76,11 +94,13 @@ func (h InlineHandler) Handle(ctx context.Context, query InlineQuery) error {
 	started := cache.StartPrepare(cacheKey)
 	if started {
 		h.logInfo("inline media prepare queued", reelURL)
+		h.recordInlineQuery("cache_miss_queued", platform)
 		defer h.runBackground(func() {
 			h.prepareInlineMedia(reelURL, cacheKey, storageChatID)
 		})
 	} else {
 		h.logInfo("inline media prepare already running", reelURL)
+		h.recordInlineQuery("cache_miss_inflight", platform)
 	}
 	return h.answerPreparing(ctx, query.ID)
 }
@@ -88,45 +108,61 @@ func (h InlineHandler) Handle(ctx context.Context, query InlineQuery) error {
 func (h InlineHandler) HandleChosen(ctx context.Context, chosen ChosenInlineResult) error {
 	if chosen.InlineMessageID == "" {
 		h.logError("chosen inline result has no inline_message_id", fmt.Errorf("inline feedback disabled or missing inline keyboard"), chosen.Query, "result_id", chosen.ResultID)
+		h.recordInlineChosen("missing_inline_message_id", "unknown", "unknown", sourcePlatform(chosen.Query))
 		return nil
 	}
 	reelURL, err := reels.ExtractURL(strings.TrimSpace(chosen.Query))
 	if err != nil {
+		h.recordInlineChosen("bad_query", "unknown", "unknown", "unknown")
 		return h.Telegram.EditInlineMessageText(ctx, chosen.InlineMessageID, "Could not find a supported URL in this inline query.")
 	}
 	reelURL = withDefaultScheme(reelURL)
+	platform := sourcePlatform(reelURL)
 	storageChatID, ok := h.storageChatIDForUser(chosen.FromUserID)
 	if !ok {
+		h.recordInlineChosen("start_required", "unknown", "unknown", platform)
 		return h.Telegram.EditInlineMessageText(ctx, chosen.InlineMessageID, "Open @ReelsovozBot and press Start first.")
 	}
 	cacheKey := h.mediaCacheKeyForUser(reelURL, chosen.FromUserID)
 	cache := h.mediaCache()
 	if cached, ok := cache.Get(cacheKey); ok {
-		return h.editInlineMessageToCachedMedia(ctx, chosen.InlineMessageID, cached)
+		kind := firstCachedKind(cached)
+		h.recordInlineChosen("cache_hit", kind, "cache", platform)
+		err := h.editInlineMessageToCachedMedia(ctx, chosen.InlineMessageID, cached)
+		h.recordInlineMediaSent(kind, "cache", statusFromError(ctx, err))
+		return err
 	}
 	cache.AddWaiter(cacheKey, chosen.InlineMessageID)
 	if cache.StartPrepare(cacheKey) {
 		h.logInfo("inline media prepare queued from chosen result", reelURL)
+		h.recordInlineChosen("prepare_queued", "unknown", "unknown", platform)
 		h.runBackground(func() {
 			h.prepareInlineMedia(reelURL, cacheKey, storageChatID)
 		})
+	} else {
+		h.recordInlineChosen("waiting", "unknown", "unknown", platform)
 	}
 	return nil
 }
 
 func (h InlineHandler) HandleStart(ctx context.Context, cmd StartCommand) error {
 	if h.Telegram == nil {
+		h.recordStartCommand("error")
 		return fmt.Errorf("telegram client is nil")
 	}
 	if cmd.ChatType != "" && cmd.ChatType != "private" {
+		h.recordStartCommand("non_private")
 		return h.Telegram.SendMessage(ctx, cmd.ChatID, "Open a private chat with @ReelsovozBot and press Start there.")
 	}
 	if h.StorageRegistry == nil {
+		h.recordStartCommand("not_configured")
 		return h.Telegram.SendMessage(ctx, cmd.ChatID, "Storage registration is not configured for this bot.")
 	}
 	if err := h.StorageRegistry.Register(cmd.UserID, cmd.ChatID); err != nil {
+		h.recordStartCommand("error")
 		return err
 	}
+	h.recordStartCommand("success")
 	return h.Telegram.SendMessage(ctx, cmd.ChatID, "Storage registered. Now you can use @ReelsovozBot inline mode.")
 }
 
@@ -157,7 +193,10 @@ func (h InlineHandler) prepareInlineMedia(reelURL string, cacheKey string, stora
 	ctx, cancel := context.WithTimeout(context.Background(), h.prepareTimeout())
 	defer cancel()
 
+	platform := sourcePlatform(reelURL)
+	downloadStarted := time.Now()
 	media, err := h.Service.Download(ctx, reelURL)
+	h.recordDownload(platform, statusFromError(ctx, err), time.Since(downloadStarted))
 	if err != nil {
 		h.logError("download inline media failed", err, reelURL)
 		h.editPendingInlineMessages(ctx, cacheKey, nil, "Could not download this media.")
@@ -167,6 +206,10 @@ func (h InlineHandler) prepareInlineMedia(reelURL string, cacheKey string, stora
 		h.logError("download inline media returned no supported media", fmt.Errorf("empty media result"), reelURL)
 		h.editPendingInlineMessages(ctx, cacheKey, nil, "This reel has no supported media.")
 		return
+	}
+
+	for _, item := range media {
+		h.recordDownloadedMedia(platform, string(item.Kind), len(item.Bytes))
 	}
 
 	cached := make([]CachedMedia, 0, len(media))
@@ -193,9 +236,13 @@ func (h InlineHandler) editPendingInlineMessages(ctx context.Context, cacheKey s
 			}
 			continue
 		}
+		kind := firstCachedKind(media)
 		if err := h.editInlineMessageToCachedMedia(ctx, inlineMessageID, media); err != nil {
+			h.recordInlineMediaSent(kind, "async", "error")
 			h.logError("edit pending inline message media failed", err, "", "inline_message_id", inlineMessageID)
+			continue
 		}
+		h.recordInlineMediaSent(kind, "async", "success")
 	}
 }
 
@@ -258,7 +305,10 @@ func (h InlineHandler) uploadAndBuildResult(ctx context.Context, reelURL string,
 	}
 	switch media.Kind {
 	case MediaKindVideo:
+		h.recordStorageUploadSize(string(media.Kind), len(media.Bytes))
+		started := time.Now()
 		fileID, err := h.Telegram.UploadVideo(ctx, storageChatID, media)
+		h.recordStorageUpload(string(media.Kind), statusFromError(ctx, err), time.Since(started))
 		if err != nil {
 			return CachedMedia{}, nil, err
 		}
@@ -270,7 +320,10 @@ func (h InlineHandler) uploadAndBuildResult(ctx context.Context, reelURL string,
 			Description: cached.Description,
 		}, nil
 	case MediaKindPhoto:
+		h.recordStorageUploadSize(string(media.Kind), len(media.Bytes))
+		started := time.Now()
 		fileID, err := h.Telegram.UploadPhoto(ctx, storageChatID, media)
+		h.recordStorageUpload(string(media.Kind), statusFromError(ctx, err), time.Since(started))
 		if err != nil {
 			return CachedMedia{}, nil, err
 		}
@@ -283,6 +336,56 @@ func (h InlineHandler) uploadAndBuildResult(ctx context.Context, reelURL string,
 		}, nil
 	default:
 		return CachedMedia{}, nil, fmt.Errorf("unsupported media kind %q", media.Kind)
+	}
+}
+
+func (h InlineHandler) recordStartCommand(result string) {
+	if h.Metrics != nil {
+		h.Metrics.IncStartCommand(result)
+	}
+}
+
+func (h InlineHandler) recordInlineQuery(result string, platform string) {
+	if h.Metrics != nil {
+		h.Metrics.IncInlineQuery(result, platform)
+	}
+}
+
+func (h InlineHandler) recordInlineChosen(result string, kind string, source string, platform string) {
+	if h.Metrics != nil {
+		h.Metrics.IncInlineChosen(result, kind, source, platform)
+	}
+}
+
+func (h InlineHandler) recordDownload(platform string, status string, duration time.Duration) {
+	if h.Metrics != nil {
+		h.Metrics.ObserveDownload(platform, status, duration)
+	}
+}
+
+func (h InlineHandler) recordDownloadedMedia(platform string, kind string, sizeBytes int) {
+	if h.Metrics == nil {
+		return
+	}
+	h.Metrics.IncDownloadedMedia(platform, kind)
+	h.Metrics.ObserveDownloadedMediaSize(platform, kind, sizeBytes)
+}
+
+func (h InlineHandler) recordStorageUpload(kind string, status string, duration time.Duration) {
+	if h.Metrics != nil {
+		h.Metrics.ObserveStorageUpload(kind, status, duration)
+	}
+}
+
+func (h InlineHandler) recordStorageUploadSize(kind string, sizeBytes int) {
+	if h.Metrics != nil {
+		h.Metrics.ObserveStorageUploadSize(kind, sizeBytes)
+	}
+}
+
+func (h InlineHandler) recordInlineMediaSent(kind string, source string, status string) {
+	if h.Metrics != nil {
+		h.Metrics.IncInlineMediaSent(kind, source, status)
 	}
 }
 
@@ -490,6 +593,35 @@ func urlParts(raw string) (string, string) {
 		return "", ""
 	}
 	return parsed.Hostname(), parsed.EscapedPath()
+}
+
+func sourcePlatform(raw string) string {
+	host, _ := urlParts(raw)
+	switch {
+	case strings.Contains(host, "instagram.com"):
+		return "instagram"
+	case strings.Contains(host, "tiktok.com"):
+		return "tiktok"
+	default:
+		return "unknown"
+	}
+}
+
+func statusFromError(ctx context.Context, err error) string {
+	if err == nil {
+		return "success"
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return "timeout"
+	}
+	return "error"
+}
+
+func firstCachedKind(media []CachedMedia) string {
+	if len(media) == 0 {
+		return "unknown"
+	}
+	return string(media[0].Kind)
 }
 
 func mediaCacheKey(raw string) string {

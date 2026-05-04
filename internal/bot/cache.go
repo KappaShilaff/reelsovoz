@@ -18,6 +18,12 @@ type MediaCache struct {
 	waiters  map[string][]string
 }
 
+type MediaCacheStats struct {
+	Entries  int
+	Inflight int
+	Waiters  int
+}
+
 type mediaCacheEntry struct {
 	items     []CachedMedia
 	expiresAt time.Time
@@ -150,6 +156,24 @@ func (c *MediaCache) CleanupExpired() int {
 		}
 	}
 	return deleted
+}
+
+func (c *MediaCache) Stats() MediaCacheStats {
+	if c == nil {
+		return MediaCacheStats{}
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	waiters := 0
+	for _, values := range c.waiters {
+		waiters += len(values)
+	}
+	return MediaCacheStats{
+		Entries:  len(c.entries),
+		Inflight: len(c.inflight),
+		Waiters:  waiters,
+	}
 }
 
 func cloneCachedMedia(items []CachedMedia) []CachedMedia {

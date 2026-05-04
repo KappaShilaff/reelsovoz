@@ -52,6 +52,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.HealthAddr != ":8000" {
 		t.Fatalf("HealthAddr = %q", cfg.HealthAddr)
 	}
+	if cfg.MetricsAddr != ":10000" {
+		t.Fatalf("MetricsAddr = %q", cfg.MetricsAddr)
+	}
 }
 
 func TestLoadOverrides(t *testing.T) {
@@ -66,6 +69,7 @@ func TestLoadOverrides(t *testing.T) {
 	t.Setenv("TELEGRAM_UPLOAD_TIMEOUT", "3m")
 	t.Setenv("MAX_VIDEO_BYTES", "123")
 	t.Setenv("HEALTH_ADDR", "127.0.0.1:9000")
+	t.Setenv("METRICS_ADDR", "127.0.0.1:10000")
 	t.Setenv("USER_STORAGE_FILE", "/tmp/reelsovoz-users.json")
 
 	cfg, err := Load()
@@ -105,6 +109,9 @@ func TestLoadOverrides(t *testing.T) {
 	}
 	if cfg.HealthAddr != "127.0.0.1:9000" {
 		t.Fatalf("HealthAddr = %q", cfg.HealthAddr)
+	}
+	if cfg.MetricsAddr != "127.0.0.1:10000" {
+		t.Fatalf("MetricsAddr = %q", cfg.MetricsAddr)
 	}
 }
 

@@ -16,6 +16,7 @@ import (
 	"github.com/KappaShilaff/reelsovoz/internal/config"
 	"github.com/KappaShilaff/reelsovoz/internal/health"
 	"github.com/KappaShilaff/reelsovoz/internal/logging"
+	"github.com/KappaShilaff/reelsovoz/internal/metrics"
 	"github.com/KappaShilaff/reelsovoz/internal/reels"
 )
 
@@ -42,7 +43,20 @@ func main() {
 		exitWithError(logger, "create telegram bot", err)
 	}
 
+	mediaCache := bot.NewMediaCache(0)
+	metricsRecorder := metrics.New(metrics.Options{
+		RegisteredUsers: storageRegistry.Count,
+		CacheStats: func() metrics.CacheStats {
+			stats := mediaCache.Stats()
+			return metrics.CacheStats{
+				Entries:  stats.Entries,
+				Inflight: stats.Inflight,
+				Waiters:  stats.Waiters,
+			}
+		},
+	})
 	health.Start(context.Background(), cfg.HealthAddr, logger)
+	metrics.Start(context.Background(), cfg.MetricsAddr, logger, metricsRecorder.Handler())
 
 	dispatcher := ext.NewDispatcher(&ext.DispatcherOpts{
 		Error: func(_ *gotgbot.Bot, _ *ext.Context, err error) ext.DispatcherAction {
@@ -60,13 +74,16 @@ func main() {
 			InstagramCookiesFile: cfg.InstagramCookiesFile,
 			Timeout:              cfg.DownloadTimeout,
 			MaxBytes:             cfg.MaxVideoBytes,
+			Metrics:              metricsRecorder,
 		}},
 		Logger:          logger,
+		Cache:           mediaCache,
 		StorageChatID:   cfg.TelegramStorageChatID,
 		StorageRegistry: storageRegistry,
 		PrepareTimeout:  cfg.PrepareTimeout,
 		UploadRetries:   cfg.TelegramUploadRetries,
 		UploadTimeout:   cfg.TelegramUploadTimeout,
+		Metrics:         metricsRecorder,
 	}
 	dispatcher.AddHandler(handlers.NewCommand("start", inlineHandler.HandleStartGotgbot))
 	dispatcher.AddHandler(handlers.NewInlineQuery(inlinequery.All, inlineHandler.HandleGotgbot))

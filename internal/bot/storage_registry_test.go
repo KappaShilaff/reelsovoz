@@ -39,6 +39,9 @@ func TestUserStorageRegistryRegisterPersistsAndReloads(t *testing.T) {
 	if !ok {
 		t.Fatal("reloaded storage not found")
 	}
+	if reloaded.Count() != 1 {
+		t.Fatalf("registered users = %d, want 1", reloaded.Count())
+	}
 	if storage.UserID != 777 || storage.ChatID != 348313485 {
 		t.Fatalf("storage = %#v", storage)
 	}

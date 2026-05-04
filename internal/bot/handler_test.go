@@ -44,6 +44,52 @@ type fakeLogger struct {
 	infoFields    [][]any
 }
 
+type fakeMetricsRecorder struct {
+	startResults  []string
+	inlineQueries []inlineQueryMetric
+	inlineChosen  []inlineChosenMetric
+	downloads     []downloadMetric
+	downloaded    []mediaMetric
+	downloadSizes []mediaMetric
+	uploadSizes   []mediaMetric
+	uploads       []uploadMetric
+	sent          []sentMetric
+}
+
+type inlineQueryMetric struct {
+	result   string
+	platform string
+}
+
+type inlineChosenMetric struct {
+	result   string
+	kind     string
+	source   string
+	platform string
+}
+
+type downloadMetric struct {
+	platform string
+	status   string
+}
+
+type mediaMetric struct {
+	platform string
+	kind     string
+	size     int
+}
+
+type uploadMetric struct {
+	kind   string
+	status string
+}
+
+type sentMetric struct {
+	kind   string
+	source string
+	status string
+}
+
 func (l *fakeLogger) Error(msg string, args ...any) {
 	l.errorMessages = append(l.errorMessages, msg)
 	l.errorFields = append(l.errorFields, args)
@@ -52,6 +98,42 @@ func (l *fakeLogger) Error(msg string, args ...any) {
 func (l *fakeLogger) Info(msg string, args ...any) {
 	l.infoMessages = append(l.infoMessages, msg)
 	l.infoFields = append(l.infoFields, args)
+}
+
+func (m *fakeMetricsRecorder) IncStartCommand(result string) {
+	m.startResults = append(m.startResults, result)
+}
+
+func (m *fakeMetricsRecorder) IncInlineQuery(result string, platform string) {
+	m.inlineQueries = append(m.inlineQueries, inlineQueryMetric{result: result, platform: platform})
+}
+
+func (m *fakeMetricsRecorder) IncInlineChosen(result string, kind string, source string, platform string) {
+	m.inlineChosen = append(m.inlineChosen, inlineChosenMetric{result: result, kind: kind, source: source, platform: platform})
+}
+
+func (m *fakeMetricsRecorder) ObserveDownload(platform string, status string, _ time.Duration) {
+	m.downloads = append(m.downloads, downloadMetric{platform: platform, status: status})
+}
+
+func (m *fakeMetricsRecorder) IncDownloadedMedia(platform string, kind string) {
+	m.downloaded = append(m.downloaded, mediaMetric{platform: platform, kind: kind})
+}
+
+func (m *fakeMetricsRecorder) ObserveDownloadedMediaSize(platform string, kind string, sizeBytes int) {
+	m.downloadSizes = append(m.downloadSizes, mediaMetric{platform: platform, kind: kind, size: sizeBytes})
+}
+
+func (m *fakeMetricsRecorder) ObserveStorageUpload(kind string, status string, _ time.Duration) {
+	m.uploads = append(m.uploads, uploadMetric{kind: kind, status: status})
+}
+
+func (m *fakeMetricsRecorder) ObserveStorageUploadSize(kind string, sizeBytes int) {
+	m.uploadSizes = append(m.uploadSizes, mediaMetric{kind: kind, size: sizeBytes})
+}
+
+func (m *fakeMetricsRecorder) IncInlineMediaSent(kind string, source string, status string) {
+	m.sent = append(m.sent, sentMetric{kind: kind, source: source, status: status})
 }
 
 type uploadCall struct {
@@ -455,6 +537,64 @@ func TestInlineHandlerEditsChosenPlaceholderAfterPrepare(t *testing.T) {
 	}
 }
 
+func TestInlineHandlerRecordsMetricsForPrepareUploadAndSend(t *testing.T) {
+	service := &fakeReelsService{
+		media: []Media{{
+			Kind:  MediaKindVideo,
+			Bytes: []byte("video bytes"),
+		}},
+	}
+	telegram := &fakeTelegramClient{videoFileID: "telegram-file-id"}
+	runner := &capturedRunner{}
+	metrics := &fakeMetricsRecorder{}
+	handler := InlineHandler{
+		Service:       service,
+		Telegram:      telegram,
+		Cache:         NewMediaCache(defaultMediaCacheTTL),
+		StorageChatID: -100123,
+		RunBackground: runner.run,
+		Metrics:       metrics,
+	}
+
+	const reelURL = "https://www.instagram.com/p/DXg3XpNjG4g/"
+	if err := handler.Handle(context.Background(), InlineQuery{ID: "inline-1", Query: reelURL}); err != nil {
+		t.Fatalf("Handle() error = %v", err)
+	}
+	if err := handler.HandleChosen(context.Background(), ChosenInlineResult{
+		ResultID:        "preparing",
+		Query:           reelURL,
+		InlineMessageID: "inline-message-1",
+	}); err != nil {
+		t.Fatalf("HandleChosen() error = %v", err)
+	}
+	runner.runNext(t)
+
+	if got, want := metrics.inlineQueries, []inlineQueryMetric{{result: "cache_miss_queued", platform: "instagram"}}; len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("inline query metrics = %#v, want %#v", got, want)
+	}
+	if got, want := metrics.inlineChosen, []inlineChosenMetric{{result: "waiting", kind: "unknown", source: "unknown", platform: "instagram"}}; len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("inline chosen metrics = %#v, want %#v", got, want)
+	}
+	if got, want := metrics.downloads, []downloadMetric{{platform: "instagram", status: "success"}}; len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("download metrics = %#v, want %#v", got, want)
+	}
+	if got, want := metrics.downloaded, []mediaMetric{{platform: "instagram", kind: "video"}}; len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("downloaded media metrics = %#v, want %#v", got, want)
+	}
+	if got, want := metrics.downloadSizes, []mediaMetric{{platform: "instagram", kind: "video", size: len("video bytes")}}; len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("download size metrics = %#v, want %#v", got, want)
+	}
+	if got, want := metrics.uploadSizes, []mediaMetric{{kind: "video", size: len("video bytes")}}; len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("upload size metrics = %#v, want %#v", got, want)
+	}
+	if got, want := metrics.uploads, []uploadMetric{{kind: "video", status: "success"}}; len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("upload metrics = %#v, want %#v", got, want)
+	}
+	if got, want := metrics.sent, []sentMetric{{kind: "video", source: "async", status: "success"}}; len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("sent metrics = %#v, want %#v", got, want)
+	}
+}
+
 func TestInlineHandlerEditsChosenPlaceholderFromCache(t *testing.T) {
 	service := &fakeReelsService{}
 	telegram := &fakeTelegramClient{}
@@ -636,9 +776,11 @@ func TestInlineHandlerRegistersUserStorageOnStart(t *testing.T) {
 		t.Fatalf("LoadUserStorageRegistry() error = %v", err)
 	}
 	telegram := &fakeTelegramClient{}
+	metrics := &fakeMetricsRecorder{}
 	handler := InlineHandler{
 		Telegram:        telegram,
 		StorageRegistry: registry,
+		Metrics:         metrics,
 	}
 
 	if err := handler.HandleStart(context.Background(), StartCommand{UserID: 777, ChatID: 348313485}); err != nil {
@@ -657,6 +799,12 @@ func TestInlineHandlerRegistersUserStorageOnStart(t *testing.T) {
 	}
 	if telegram.messages[0].chatID != 348313485 {
 		t.Fatalf("message chat id = %d, want 348313485", telegram.messages[0].chatID)
+	}
+	if registry.Count() != 1 {
+		t.Fatalf("registry count = %d, want 1", registry.Count())
+	}
+	if got, want := metrics.startResults, []string{"success"}; len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("start metrics = %#v, want %#v", got, want)
 	}
 }
 

@@ -18,6 +18,7 @@ const (
 	defaultUploadTimeout = 120 * time.Second
 	defaultMaxVideoBytes = int64(50_331_648)
 	defaultHealthAddr    = ":8000"
+	defaultMetricsAddr   = ":10000"
 	defaultUserStorage   = "/data/reelsovoz-users.json"
 	instagramCookiesPath = "/tmp/reelsovoz-instagram-cookies.txt"
 )
@@ -39,6 +40,7 @@ type Config struct {
 	TelegramUploadTimeout time.Duration
 	MaxVideoBytes         int64
 	HealthAddr            string
+	MetricsAddr           string
 }
 
 func Load() (Config, error) {
@@ -100,6 +102,7 @@ func Load() (Config, error) {
 	}
 
 	cfg.HealthAddr = envOrDefault("HEALTH_ADDR", defaultHealthAddr)
+	cfg.MetricsAddr = envOrDefault("METRICS_ADDR", defaultMetricsAddr)
 
 	return cfg, nil
 }

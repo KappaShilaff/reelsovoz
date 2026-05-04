@@ -1178,6 +1178,60 @@ func TestDownloaderAppliesMaxBytesToSynthesizedVideo(t *testing.T) {
 	}
 }
 
+func TestDownloaderRecordsFFmpegMetricsForSinglePhotoAudio(t *testing.T) {
+	ffmpeg := newFakeFFmpeg(t, "mp4")
+	metrics := &fakeFFmpegMetrics{}
+
+	_, err := Downloader{
+		FFmpegPath: ffmpeg.path,
+		MaxBytes:   200_000,
+		Metrics:    metrics,
+	}.synthesizeVideo(context.Background(), []byte("jpg"), []byte("audio"), 0, time.Second)
+	if err != nil {
+		t.Fatalf("synthesizeVideo() error = %v", err)
+	}
+
+	if got, want := metrics.calls, []ffmpegMetric{{platform: "unknown", operation: "single_photo_audio", status: "success"}}; len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("ffmpeg metrics = %#v, want %#v", got, want)
+	}
+}
+
+func TestDownloaderRecordsFFmpegMetricsForSlideshowPhotoAudio(t *testing.T) {
+	ffmpeg := newFakeFFmpeg(t, "mp4")
+	metrics := &fakeFFmpegMetrics{}
+
+	_, err := Downloader{
+		FFmpegPath: ffmpeg.path,
+		MaxBytes:   200_000,
+		Metrics:    metrics,
+	}.synthesizeSlideshowVideo(context.Background(), [][]byte{[]byte("first"), []byte("second")}, []byte("audio"), 0, time.Second, "tiktok")
+	if err != nil {
+		t.Fatalf("synthesizeSlideshowVideo() error = %v", err)
+	}
+
+	if got, want := metrics.calls, []ffmpegMetric{{platform: "tiktok", operation: "slideshow_photo_audio", status: "success"}}; len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("ffmpeg metrics = %#v, want %#v", got, want)
+	}
+}
+
+func TestDownloaderRecordsFFmpegMetricsForError(t *testing.T) {
+	ffmpeg := newFailingFFmpeg(t)
+	metrics := &fakeFFmpegMetrics{}
+
+	_, err := Downloader{
+		FFmpegPath: ffmpeg.path,
+		MaxBytes:   200_000,
+		Metrics:    metrics,
+	}.synthesizeVideo(context.Background(), []byte("jpg"), []byte("audio"), 0, time.Second)
+	if err == nil {
+		t.Fatal("synthesizeVideo() error = nil, want error")
+	}
+
+	if got, want := metrics.calls, []ffmpegMetric{{platform: "unknown", operation: "single_photo_audio", status: "error"}}; len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("ffmpeg metrics = %#v, want %#v", got, want)
+	}
+}
+
 func assertFastPhotoVideoEncoding(t *testing.T, args string, imageInputs int, frameRate int) {
 	t.Helper()
 	framerateArg := fmt.Sprintf("-framerate %d", frameRate)
@@ -1209,6 +1263,20 @@ type fakeFFmpeg struct {
 	logPath string
 }
 
+type fakeFFmpegMetrics struct {
+	calls []ffmpegMetric
+}
+
+type ffmpegMetric struct {
+	platform  string
+	operation string
+	status    string
+}
+
+func (m *fakeFFmpegMetrics) ObserveFFmpeg(platform string, operation string, status string, _ time.Duration) {
+	m.calls = append(m.calls, ffmpegMetric{platform: platform, operation: operation, status: status})
+}
+
 func newFakeFFmpeg(t *testing.T, output string) fakeFFmpeg {
 	t.Helper()
 
@@ -1227,6 +1295,24 @@ printf '%s' "$FAKE_FFMPEG_OUTPUT" > "$out"
 		t.Fatalf("write fake ffmpeg: %v", err)
 	}
 	t.Setenv("FAKE_FFMPEG_OUTPUT", output)
+	t.Setenv("FAKE_FFMPEG_LOG", logPath)
+	return fakeFFmpeg{path: path, logPath: logPath}
+}
+
+func newFailingFFmpeg(t *testing.T) fakeFFmpeg {
+	t.Helper()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ffmpeg")
+	logPath := filepath.Join(dir, "ffmpeg.log")
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_FFMPEG_LOG"
+printf 'ffmpeg failed' >&2
+exit 2
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake ffmpeg: %v", err)
+	}
 	t.Setenv("FAKE_FFMPEG_LOG", logPath)
 	return fakeFFmpeg{path: path, logPath: logPath}
 }

@@ -67,6 +67,7 @@ Usually leave these defaults:
 - `TELEGRAM_UPLOAD_TIMEOUT=120s`
 - `MAX_VIDEO_BYTES=50331648`
 - `HEALTH_ADDR=:8000`
+- `METRICS_ADDR=:10000`
 
 Optional:
 
@@ -75,6 +76,12 @@ Optional:
 - `TELEGRAM_STORAGE_CHAT_ID`: legacy single storage chat fallback. Most installs should use `/start` per user instead.
 
 The Compose file stores state in the Docker volume `reelsovoz-data`, mounted at `/data`.
+
+## Metrics
+
+Prometheus metrics are exposed at `http://127.0.0.1:10000/metrics` by default.
+
+They include registered user count, cache state, download/upload counters, media sizes, inline send counters, and FFmpeg duration histograms.
 
 ## Instagram Cookies
 
@@ -131,6 +138,10 @@ Health endpoints:
 
 - `http://127.0.0.1:8000/healthz`
 - `http://127.0.0.1:8000/readyz`
+
+Metrics endpoint:
+
+- `http://127.0.0.1:10000/metrics`
 
 ## Local Development
 

@@ -112,6 +112,15 @@ func (r *UserStorageRegistry) Get(userID int64) (UserStorage, bool) {
 	return userStorage, ok
 }
 
+func (r *UserStorageRegistry) Count() int {
+	if r == nil {
+		return 0
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.users)
+}
+
 func (r *UserStorageRegistry) currentTime() time.Time {
 	if r.now != nil {
 		return r.now().UTC()

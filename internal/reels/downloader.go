@@ -93,6 +93,11 @@ type Downloader struct {
 	MaxBytes               int64
 	TikTokAPIBaseURL       string
 	TikTokMobileAPIBaseURL string
+	Metrics                FFmpegMetricsRecorder
+}
+
+type FFmpegMetricsRecorder interface {
+	ObserveFFmpeg(platform string, operation string, status string, duration time.Duration)
 }
 
 type MediaKind string
@@ -537,7 +542,7 @@ func (d Downloader) downloadInstagramPhotoPost(ctx context.Context, rawURL strin
 	duration := audioSelection.effectiveDuration()
 	videoImages := downloadedMediaBytes(photos)
 	videoDuration := slideshowVideoDuration(duration, len(videoImages))
-	video, err := d.synthesizeSlideshowVideo(ctx, videoImages, audio, audioSelection.StartOffset, duration)
+	video, err := d.synthesizeSlideshowVideo(ctx, videoImages, audio, audioSelection.StartOffset, duration, "instagram")
 	if err != nil {
 		return nil, err
 	}
@@ -611,7 +616,7 @@ func (d Downloader) downloadTikTokPhotoPost(ctx context.Context, rawURL string) 
 	duration := audioSelection.effectiveDuration()
 	videoImages := downloadedMediaBytes(photos)
 	videoDuration := slideshowVideoDuration(duration, len(videoImages))
-	video, err := d.synthesizeSlideshowVideo(ctx, videoImages, audio, audioSelection.StartOffset, duration)
+	video, err := d.synthesizeSlideshowVideo(ctx, videoImages, audio, audioSelection.StartOffset, duration, "tiktok")
 	if err != nil {
 		return nil, err
 	}
@@ -1141,10 +1146,10 @@ func (d Downloader) addInstagramCookies(req *http.Request) error {
 }
 
 func (d Downloader) synthesizeVideo(ctx context.Context, image []byte, audio []byte, audioStart time.Duration, duration time.Duration) ([]byte, error) {
-	return d.synthesizeSlideshowVideo(ctx, [][]byte{image}, audio, audioStart, duration)
+	return d.synthesizeSlideshowVideo(ctx, [][]byte{image}, audio, audioStart, duration, "unknown")
 }
 
-func (d Downloader) synthesizeSlideshowVideo(ctx context.Context, images [][]byte, audio []byte, audioStart time.Duration, audioDuration time.Duration) ([]byte, error) {
+func (d Downloader) synthesizeSlideshowVideo(ctx context.Context, images [][]byte, audio []byte, audioStart time.Duration, audioDuration time.Duration, platform string) ([]byte, error) {
 	if len(images) == 0 {
 		return nil, fmt.Errorf("synthesize slideshow: no images")
 	}
@@ -1214,7 +1219,11 @@ func (d Downloader) synthesizeSlideshowVideo(ctx context.Context, images [][]byt
 	var stderr cappedBuffer
 	cmd := exec.CommandContext(ctx, d.ffmpegExecutable(), args...)
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	operation := ffmpegPhotoOperation(len(images))
+	started := time.Now()
+	err = cmd.Run()
+	d.recordFFmpeg(platform, operation, ffmpegStatus(ctx, err), time.Since(started))
+	if err != nil {
 		return nil, commandError("ffmpeg synthesize", err, stderr.String(), ctx.Err())
 	}
 
@@ -1228,6 +1237,29 @@ func (d Downloader) synthesizeSlideshowVideo(ctx context.Context, images [][]byt
 		return nil, err
 	}
 	return body, nil
+}
+
+func (d Downloader) recordFFmpeg(platform string, operation string, status string, duration time.Duration) {
+	if d.Metrics != nil {
+		d.Metrics.ObserveFFmpeg(platform, operation, status, duration)
+	}
+}
+
+func ffmpegPhotoOperation(imageCount int) string {
+	if imageCount <= 1 {
+		return "single_photo_audio"
+	}
+	return "slideshow_photo_audio"
+}
+
+func ffmpegStatus(ctx context.Context, err error) string {
+	if err == nil {
+		return "success"
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return "timeout"
+	}
+	return "error"
 }
 
 func photoVideoFrameRateForImageCount(imageCount int) int {
