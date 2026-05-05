@@ -859,6 +859,49 @@ func TestDownloaderSynthesizesInstagramPhotoPostWithAuthenticatedMetadataAudio(t
 	}
 }
 
+func TestDownloaderRetriesInstagramPhotoAudioMetadata(t *testing.T) {
+	ffmpeg := newFakeFFmpeg(t, "instagram-retried-mp4")
+	metadataCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/p/DXfJlTsDNFr/":
+			_, _ = w.Write([]byte(`<html><head><meta property="og:image" content="` + serverURL(r, "/page-image.jpg") + `"></head></html>`))
+		case "/api/v1/media/3881863549996028267/info":
+			metadataCalls++
+			w.Header().Set("Content-Type", "application/json")
+			if metadataCalls < 3 {
+				_, _ = w.Write([]byte(`{"items":[{"image_versions2":{"candidates":[{"url":"` + serverURL(r, "/metadata-image.jpg") + `"}]},"music_info":{"music_asset_info":{"title":"song"}}}]}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"items":[{"image_versions2":{"candidates":[{"url":"` + serverURL(r, "/metadata-image.jpg") + `"}]},"music_info":{"music_asset_info":{"progressive_download_url":"` + serverURL(r, "/audio.m4a") + `","overlap_duration_in_ms":30000}}}]}`))
+		case "/page-image.jpg", "/metadata-image.jpg":
+			w.Header().Set("Content-Type", "image/jpeg")
+			_, _ = w.Write(jpegBytes(t, 1280, 720))
+		case "/audio.m4a":
+			w.Header().Set("Content-Type", "audio/mp4")
+			_, _ = w.Write([]byte("audio"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	got, err := Downloader{
+		FFmpegPath:          ffmpeg.path,
+		InstagramAPIBaseURL: server.URL,
+		MaxBytes:            200_000,
+	}.downloadInstagramPhotoPost(context.Background(), server.URL+"/p/DXfJlTsDNFr/")
+	if err != nil {
+		t.Fatalf("downloadInstagramPhotoPost() error = %v", err)
+	}
+	if metadataCalls != 3 {
+		t.Fatalf("metadata calls = %d, want 3", metadataCalls)
+	}
+	if len(got) != 1 || got[0].Kind != MediaKindVideo {
+		t.Fatalf("downloaded media = %#v, want one video", got)
+	}
+}
+
 func TestDownloaderExtractsInstagramAudioTimingMetadata(t *testing.T) {
 	metadata := map[string]any{
 		"items": []any{

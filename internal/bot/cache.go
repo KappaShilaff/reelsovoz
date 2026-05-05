@@ -83,17 +83,27 @@ func (c *MediaCache) Get(key string) ([]CachedMedia, bool) {
 		c.mu.Unlock()
 		return nil, false
 	}
-	return cloneCachedMedia(entry.items), true
+	cacheable := cacheableCachedMedia(entry.items)
+	if len(cacheable) == 0 {
+		c.mu.Lock()
+		if current, ok := c.entries[key]; ok && len(cacheableCachedMedia(current.items)) == 0 {
+			delete(c.entries, key)
+		}
+		c.mu.Unlock()
+		return nil, false
+	}
+	return cacheable, true
 }
 
 func (c *MediaCache) Set(key string, items []CachedMedia) {
-	if c == nil || len(items) == 0 {
+	cacheable := cacheableCachedMedia(items)
+	if c == nil || len(cacheable) == 0 {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.entries[key] = mediaCacheEntry{
-		items:     cloneCachedMedia(items),
+		items:     cacheable,
 		expiresAt: c.now().Add(c.ttl),
 	}
 }
@@ -180,4 +190,18 @@ func cloneCachedMedia(items []CachedMedia) []CachedMedia {
 	cloned := make([]CachedMedia, len(items))
 	copy(cloned, items)
 	return cloned
+}
+
+func cacheableCachedMedia(items []CachedMedia) []CachedMedia {
+	if len(items) == 0 {
+		return nil
+	}
+	cacheable := make([]CachedMedia, 0, len(items))
+	for _, item := range items {
+		if item.Kind != MediaKindVideo {
+			continue
+		}
+		cacheable = append(cacheable, item)
+	}
+	return cloneCachedMedia(cacheable)
 }

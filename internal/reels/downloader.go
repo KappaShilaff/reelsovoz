@@ -25,22 +25,23 @@ import (
 )
 
 const (
-	defaultOutputFilename  = "reel.mp4"
-	defaultOutputMIME      = "video/mp4"
-	defaultPhotoFilename   = "photo.jpg"
-	defaultPhotoMIME       = "image/jpeg"
-	photoAudioMaxDuration  = 90 * time.Second
-	photoSlideDuration     = 4 * time.Second
-	photoSlideTransition   = 500 * time.Millisecond
-	photoVideoMaxDimension = 480
-	photoVideoFrameRate    = 6
-	singlePhotoFrameRate   = 1
-	audioLoopSampleRate    = 44100
-	maxStderrBytes         = 4096
-	instagramUserAgent     = "Mozilla/5.0"
-	instagramAPIBaseURL    = "https://www.instagram.com"
-	tikTokAPIBaseURL       = "https://www.tikwm.com"
-	tikTokMobileAPIBaseURL = "https://api16-normal-c-useast1a.tiktokv.com"
+	defaultOutputFilename              = "reel.mp4"
+	defaultOutputMIME                  = "video/mp4"
+	defaultPhotoFilename               = "photo.jpg"
+	defaultPhotoMIME                   = "image/jpeg"
+	photoAudioMaxDuration              = 90 * time.Second
+	photoSlideDuration                 = 4 * time.Second
+	photoSlideTransition               = 500 * time.Millisecond
+	photoVideoMaxDimension             = 480
+	photoVideoFrameRate                = 6
+	singlePhotoFrameRate               = 1
+	audioLoopSampleRate                = 44100
+	maxStderrBytes                     = 4096
+	instagramPhotoAudioMetadataRetries = 2
+	instagramUserAgent                 = "Mozilla/5.0"
+	instagramAPIBaseURL                = "https://www.instagram.com"
+	tikTokAPIBaseURL                   = "https://www.tikwm.com"
+	tikTokMobileAPIBaseURL             = "https://api16-normal-c-useast1a.tiktokv.com"
 )
 
 var (
@@ -485,7 +486,14 @@ func (d Downloader) downloadInstagramPhotoPost(ctx context.Context, rawURL strin
 	metadataFetched := false
 
 	if d.InstagramAPIBaseURL != "" || isInstagramPostURL(rawURL) {
-		if metadata, err := d.fetchInstagramMediaInfo(ctx, rawURL); err == nil {
+		var metadataErr error
+		for attempt := 0; attempt <= instagramPhotoAudioMetadataRetries; attempt++ {
+			metadata, err := d.fetchInstagramMediaInfo(ctx, rawURL)
+			if err != nil {
+				metadataErr = err
+				continue
+			}
+			metadataErr = nil
 			metadataFetched = true
 			metadataImages := extractInstagramMetadataImageURLs(metadata)
 			if len(metadataImages) > 0 {
@@ -493,7 +501,11 @@ func (d Downloader) downloadInstagramPhotoPost(ctx context.Context, rawURL strin
 			}
 			audioSelection = mergeInstagramAudioSelection(audioSelection, extractInstagramMetadataAudioSelection(metadata))
 			hasMusicMarker = hasMusicMarker || hasInstagramMetadataMusicMarker(metadata)
-		} else if d.InstagramCookiesFile == "" && isInstagramPostURL(rawURL) {
+			if audioSelection.URL != "" || !hasMusicMarker {
+				break
+			}
+		}
+		if metadataErr != nil && d.InstagramCookiesFile == "" && isInstagramPostURL(rawURL) {
 			hasMusicMarker = true
 		}
 	}

@@ -336,7 +336,7 @@ func TestInlineHandlerAnswersPreparingOnCacheMissAndStoresCachedVideo(t *testing
 	}
 }
 
-func TestInlineHandlerBackgroundJobUploadsMultipleMediaAndAnswersCachedResults(t *testing.T) {
+func TestInlineHandlerBackgroundJobUploadsMultipleMediaAndAnswersOnlyCachedVideos(t *testing.T) {
 	service := &fakeReelsService{
 		media: []Media{
 			{
@@ -383,8 +383,8 @@ func TestInlineHandlerBackgroundJobUploadsMultipleMediaAndAnswersCachedResults(t
 	if string(telegram.photoUploads[0].media.Bytes) != "photo bytes" {
 		t.Fatalf("uploaded photo bytes = %q", telegram.photoUploads[0].media.Bytes)
 	}
-	if len(telegram.answerResults) != 2 {
-		t.Fatalf("answer results = %d, want 2", len(telegram.answerResults))
+	if len(telegram.answerResults) != 1 {
+		t.Fatalf("answer results = %d, want 1", len(telegram.answerResults))
 	}
 	videoResult, ok := telegram.answerResults[0].(gotgbot.InlineQueryResultCachedVideo)
 	if !ok {
@@ -392,16 +392,6 @@ func TestInlineHandlerBackgroundJobUploadsMultipleMediaAndAnswersCachedResults(t
 	}
 	if videoResult.VideoFileId != "telegram-video-id" {
 		t.Fatalf("cached video file ID = %q, want telegram-video-id", videoResult.VideoFileId)
-	}
-	photoResult, ok := telegram.answerResults[1].(gotgbot.InlineQueryResultCachedPhoto)
-	if !ok {
-		t.Fatalf("answer result[1] type = %T, want InlineQueryResultCachedPhoto", telegram.answerResults[1])
-	}
-	if photoResult.PhotoFileId != "telegram-photo-id" {
-		t.Fatalf("cached photo file ID = %q, want telegram-photo-id", photoResult.PhotoFileId)
-	}
-	if photoResult.Id == videoResult.Id {
-		t.Fatalf("result IDs should differ, both are %q", photoResult.Id)
 	}
 }
 
