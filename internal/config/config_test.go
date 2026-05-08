@@ -46,7 +46,7 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.TelegramUploadTimeout != 120*time.Second {
 		t.Fatalf("TelegramUploadTimeout = %s", cfg.TelegramUploadTimeout)
 	}
-	if cfg.MaxVideoBytes != 50331648 {
+	if cfg.MaxVideoBytes != 100663296 {
 		t.Fatalf("MaxVideoBytes = %d", cfg.MaxVideoBytes)
 	}
 	if cfg.HealthAddr != ":8000" {

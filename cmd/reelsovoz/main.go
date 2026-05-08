@@ -75,6 +75,7 @@ func main() {
 			Timeout:              cfg.DownloadTimeout,
 			MaxBytes:             cfg.MaxVideoBytes,
 			Metrics:              metricsRecorder,
+			Logger:               logger,
 		}},
 		Logger:          logger,
 		Cache:           mediaCache,

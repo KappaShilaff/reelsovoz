@@ -39,7 +39,7 @@ func TestRealInstagramDownloadToDisk(t *testing.T) {
 		FFmpegPath:           envOr("FFMPEG_PATH", "ffmpeg"),
 		InstagramCookiesFile: instagramCookiesFile,
 		Timeout:              envDurationOr("DOWNLOAD_TIMEOUT", 120*time.Second),
-		MaxBytes:             envInt64Or("MAX_VIDEO_BYTES", 50_331_648),
+		MaxBytes:             envInt64Or("MAX_VIDEO_BYTES", 100_663_296),
 	}.Download(context.Background(), rawURL)
 	if err != nil {
 		t.Fatalf("Download() error = %v", err)

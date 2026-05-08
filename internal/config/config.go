@@ -16,7 +16,7 @@ const (
 	defaultPrepareTTL    = 10 * time.Minute
 	defaultUploadRetries = 3
 	defaultUploadTimeout = 120 * time.Second
-	defaultMaxVideoBytes = int64(50_331_648)
+	defaultMaxVideoBytes = int64(100_663_296)
 	defaultHealthAddr    = ":8000"
 	defaultMetricsAddr   = ":10000"
 	defaultUserStorage   = "/data/reelsovoz-users.json"

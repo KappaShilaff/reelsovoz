@@ -120,6 +120,73 @@ func TestDownloaderCancelsOnOverflow(t *testing.T) {
 	}
 }
 
+func TestDownloaderRejectsEmptyVideoDownload(t *testing.T) {
+	fake := newFakeYTDLP(t)
+	t.Setenv("FAKE_YTDLP_DOWNLOAD_EMPTY", "1")
+
+	_, err := Downloader{
+		YTDLPPath: fake.path,
+		Timeout:   time.Second,
+		MaxBytes:  64,
+	}.Download(context.Background(), "https://www.tiktok.com/@user/video/123")
+	if !errors.Is(err, ErrEmptyDownloadedMedia) {
+		t.Fatalf("Download() error = %v, want %v", err, ErrEmptyDownloadedMedia)
+	}
+
+	calls := fake.calls(t)
+	if len(calls) != 4 {
+		t.Fatalf("calls = %v, want metadata and 3 download attempts", calls)
+	}
+}
+
+func TestDownloaderRejectsEmptySynthesizedPhotoAudioVideo(t *testing.T) {
+	fake := newFakeYTDLP(t)
+	ffmpeg := newFakeFFmpeg(t, "")
+	t.Setenv("FAKE_YTDLP_METADATA_UNSUPPORTED_TIKTOK_PHOTO", "1")
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{
+				"code": 0,
+				"msg": "success",
+				"data": {
+					"title": "TikTok Photo",
+					"images": ["` + serverURL(r, "/image.jpg") + `"],
+					"music_info": {
+						"play": "` + serverURL(r, "/audio.mp3") + `",
+						"duration": 12
+					}
+				}
+			}`))
+		case "/image.jpg":
+			w.Header().Set("Content-Type", "image/jpeg")
+			_, _ = w.Write(jpegBytes(t, 1280, 720))
+		case "/audio.mp3":
+			w.Header().Set("Content-Type", "audio/mpeg")
+			_, _ = w.Write([]byte("audio-bytes"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	_, err := Downloader{
+		YTDLPPath:        fake.path,
+		FFmpegPath:       ffmpeg.path,
+		TikTokAPIBaseURL: server.URL,
+		MaxBytes:         200_000,
+	}.Download(context.Background(), "https://vt.tiktok.com/ZS9Sbqjw9/")
+	if !errors.Is(err, ErrEmptyDownloadedMedia) {
+		t.Fatalf("Download() error = %v, want %v", err, ErrEmptyDownloadedMedia)
+	}
+
+	if calls := ffmpeg.calls(t); len(calls) != 3 {
+		t.Fatalf("ffmpeg calls = %d, want 3", len(calls))
+	}
+}
+
 func TestDownloaderCapsStderrDiagnostics(t *testing.T) {
 	fake := newFakeYTDLP(t)
 	t.Setenv("FAKE_YTDLP_METADATA_FAIL", "1")
@@ -139,6 +206,114 @@ func TestDownloaderCapsStderrDiagnostics(t *testing.T) {
 	}
 	if !strings.Contains(message, "metadata-failed") {
 		t.Fatalf("error = %q, want stderr detail", message)
+	}
+}
+
+func TestDownloaderLogsYTDLPSuccess(t *testing.T) {
+	fake := newFakeYTDLP(t)
+	logger := &fakeCommandLogger{}
+
+	_, err := Downloader{
+		YTDLPPath: fake.path,
+		Timeout:   time.Second,
+		MaxBytes:  64,
+		Logger:    logger,
+	}.Download(context.Background(), "https://www.instagram.com/reel/abc123/?igsh=secret")
+	if err != nil {
+		t.Fatalf("Download() error = %v", err)
+	}
+
+	if len(logger.infoMessages) != 2 {
+		t.Fatalf("info messages = %v, want metadata and download logs", logger.infoMessages)
+	}
+	if logger.infoMessages[0] != "yt-dlp metadata fetched" {
+		t.Fatalf("metadata log message = %q", logger.infoMessages[0])
+	}
+	if !fieldsContain(logger.infoFields[0], "yt_dlp_operation", "metadata") ||
+		!fieldsContain(logger.infoFields[0], "status", "success") ||
+		!fieldsContain(logger.infoFields[0], "yt_dlp_format_id", "format-1") ||
+		!fieldsContain(logger.infoFields[0], "url_path", "/reel/abc123/") {
+		t.Fatalf("metadata fields = %#v", logger.infoFields[0])
+	}
+	if logger.infoMessages[1] != "yt-dlp download completed" {
+		t.Fatalf("download log message = %q", logger.infoMessages[1])
+	}
+	if !fieldsContain(logger.infoFields[1], "yt_dlp_operation", "download") ||
+		!fieldsContain(logger.infoFields[1], "bytes", len("mp4-bytes")) ||
+		!fieldsContain(logger.infoFields[1], "filename", defaultOutputFilename) {
+		t.Fatalf("download fields = %#v", logger.infoFields[1])
+	}
+}
+
+func TestDownloaderLogsYTDLPFailureWithSanitizedStderr(t *testing.T) {
+	fake := newFakeYTDLP(t)
+	logger := &fakeCommandLogger{}
+	t.Setenv("FAKE_YTDLP_METADATA_FAIL", "1")
+	t.Setenv("FAKE_YTDLP_METADATA_FAIL_STDERR", `ERROR: https://cdn.example/video.mp4?token=secret bot123456:ABC_secret`)
+
+	_, err := Downloader{
+		YTDLPPath: fake.path,
+		Timeout:   time.Second,
+		MaxBytes:  64,
+		Logger:    logger,
+	}.Download(context.Background(), "https://www.instagram.com/reel/abc123/?igsh=secret")
+	if err == nil {
+		t.Fatal("Download() error = nil, want metadata failure")
+	}
+
+	if len(logger.errorMessages) != 1 || logger.errorMessages[0] != "yt-dlp command failed" {
+		t.Fatalf("error messages = %v", logger.errorMessages)
+	}
+	fields := logger.errorFields[0]
+	if !fieldsContain(fields, "yt_dlp_operation", "metadata") ||
+		!fieldsContain(fields, "status", "error") ||
+		!fieldsContain(fields, "url_path", "/reel/abc123/") {
+		t.Fatalf("error fields = %#v", fields)
+	}
+	stderr, ok := fieldValue(fields, "yt_dlp_stderr").(string)
+	if !ok {
+		t.Fatalf("yt_dlp_stderr missing in fields = %#v", fields)
+	}
+	if strings.Contains(stderr, "token=secret") || strings.Contains(stderr, "ABC_secret") {
+		t.Fatalf("stderr was not sanitized: %q", stderr)
+	}
+	if !strings.Contains(stderr, "https://cdn.example/video.mp4") || !strings.Contains(stderr, "bot<TOKEN>") {
+		t.Fatalf("stderr = %q, want sanitized URL and token marker", stderr)
+	}
+}
+
+func TestDownloaderLogsYTDLPEmptyStdout(t *testing.T) {
+	fake := newFakeYTDLP(t)
+	logger := &fakeCommandLogger{}
+	t.Setenv("FAKE_YTDLP_DOWNLOAD_EMPTY", "1")
+	t.Setenv("FAKE_YTDLP_DOWNLOAD_STDERR", `download aborted https://cdn.example/file.mp4?expires=secret`)
+
+	_, err := Downloader{
+		YTDLPPath: fake.path,
+		Timeout:   time.Second,
+		MaxBytes:  64,
+		Logger:    logger,
+	}.Download(context.Background(), "https://www.instagram.com/reel/abc123/")
+	if !errors.Is(err, ErrEmptyDownloadedMedia) {
+		t.Fatalf("Download() error = %v, want %v", err, ErrEmptyDownloadedMedia)
+	}
+
+	if len(logger.errorMessages) != 3 {
+		t.Fatalf("error messages = %d, want one per empty download attempt", len(logger.errorMessages))
+	}
+	fields := logger.errorFields[0]
+	if !fieldsContain(fields, "yt_dlp_operation", "download") ||
+		!fieldsContain(fields, "status", "empty_stdout") ||
+		!fieldsContain(fields, "attempt", 1) ||
+		!fieldsContain(fields, "max_attempts", 3) {
+		t.Fatalf("empty stdout fields = %#v", fields)
+	}
+	stderr, ok := fieldValue(fields, "yt_dlp_stderr").(string)
+	if !ok {
+		t.Fatalf("yt_dlp_stderr missing in fields = %#v", fields)
+	}
+	if strings.Contains(stderr, "expires=secret") {
+		t.Fatalf("stderr was not sanitized: %q", stderr)
 	}
 }
 
@@ -1310,14 +1485,44 @@ type fakeFFmpegMetrics struct {
 	calls []ffmpegMetric
 }
 
+type fakeCommandLogger struct {
+	errorMessages []string
+	errorFields   [][]any
+	infoMessages  []string
+	infoFields    [][]any
+}
+
 type ffmpegMetric struct {
 	platform  string
 	operation string
 	status    string
 }
 
+func (l *fakeCommandLogger) Error(msg string, args ...any) {
+	l.errorMessages = append(l.errorMessages, msg)
+	l.errorFields = append(l.errorFields, args)
+}
+
+func (l *fakeCommandLogger) Info(msg string, args ...any) {
+	l.infoMessages = append(l.infoMessages, msg)
+	l.infoFields = append(l.infoFields, args)
+}
+
 func (m *fakeFFmpegMetrics) ObserveFFmpeg(platform string, operation string, status string, _ time.Duration) {
 	m.calls = append(m.calls, ffmpegMetric{platform: platform, operation: operation, status: status})
+}
+
+func fieldsContain(fields []any, key string, value any) bool {
+	return fieldValue(fields, key) == value
+}
+
+func fieldValue(fields []any, key string) any {
+	for i := 0; i+1 < len(fields); i += 2 {
+		if fields[i] == key {
+			return fields[i+1]
+		}
+	}
+	return nil
 }
 
 func newFakeFFmpeg(t *testing.T, output string) fakeFFmpeg {
@@ -1409,6 +1614,10 @@ printf '%s\n' "$*" >> "$FAKE_YTDLP_LOG"
 	for arg in "$@"; do
 		if [ "$arg" = "-j" ]; then
 			if [ -n "$FAKE_YTDLP_METADATA_FAIL" ]; then
+				if [ -n "$FAKE_YTDLP_METADATA_FAIL_STDERR" ]; then
+					printf '%s\n' "$FAKE_YTDLP_METADATA_FAIL_STDERR" >&2
+					exit 7
+				fi
 				printf 'metadata-failed %05000d\n' 1 >&2
 				exit 7
 			fi
@@ -1420,11 +1629,17 @@ printf '%s\n' "$*" >> "$FAKE_YTDLP_LOG"
 				printf 'ERROR: [Instagram] DXfJlTsDNFr: There is no video in this post\n' >&2
 				exit 1
 		fi
-		printf '{"title":"Test Reel","duration":12.5,"width":720,"height":1280}\n'
+		printf '{"id":"video-id","title":"Test Reel","format_id":"format-1","ext":"mp4","vcodec":"h264","acodec":"aac","duration":12.5,"width":720,"height":1280,"filesize":42,"filesize_approx":43}\n'
 		exit 0
 	fi
 done
 
+if [ -n "$FAKE_YTDLP_DOWNLOAD_EMPTY" ]; then
+	if [ -n "$FAKE_YTDLP_DOWNLOAD_STDERR" ]; then
+		printf '%s\n' "$FAKE_YTDLP_DOWNLOAD_STDERR" >&2
+	fi
+	exit 0
+fi
 if [ -n "$FAKE_YTDLP_DOWNLOAD" ]; then
 	printf '%s' "$FAKE_YTDLP_DOWNLOAD"
 else

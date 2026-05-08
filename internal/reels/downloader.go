@@ -38,6 +38,7 @@ const (
 	audioLoopSampleRate                = 44100
 	maxStderrBytes                     = 4096
 	instagramPhotoAudioMetadataRetries = 2
+	mediaDownloadAttempts              = 3
 	instagramUserAgent                 = "Mozilla/5.0"
 	instagramAPIBaseURL                = "https://www.instagram.com"
 	tikTokAPIBaseURL                   = "https://www.tikwm.com"
@@ -46,9 +47,12 @@ const (
 
 var (
 	ErrDownloadTooLarge           = errors.New("download exceeds max bytes")
+	ErrEmptyDownloadedMedia       = errors.New("downloaded media is empty")
 	ErrInvalidMaxBytes            = errors.New("max bytes must be positive")
 	ErrInstagramAudioUnavailable  = errors.New("instagram audio is unavailable")
 	ErrInstagramCookiesRequired   = errors.New("instagram cookies are required to fetch audio metadata")
+	telegramTokenPattern          = regexp.MustCompile(`bot[0-9]+:[A-Za-z0-9_-]+`)
+	commandURLPattern             = regexp.MustCompile(`https?://[^\s"']+`)
 	instagramShortcodeAlphabet    = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 	instagramDirectAudioFieldKeys = map[string]struct{}{
 		"audio_url":                {},
@@ -95,10 +99,16 @@ type Downloader struct {
 	TikTokAPIBaseURL       string
 	TikTokMobileAPIBaseURL string
 	Metrics                FFmpegMetricsRecorder
+	Logger                 CommandLogger
 }
 
 type FFmpegMetricsRecorder interface {
 	ObserveFFmpeg(platform string, operation string, status string, duration time.Duration)
+}
+
+type CommandLogger interface {
+	Error(msg string, args ...any)
+	Info(msg string, args ...any)
 }
 
 type MediaKind string
@@ -157,7 +167,9 @@ func (d Downloader) Download(ctx context.Context, rawURL string) ([]DownloadedMe
 		return nil, err
 	}
 
-	body, err := d.downloadBody(ctx, rawURL)
+	body, err := retryByteOperation(ctx, mediaDownloadAttempts, "yt-dlp download", func(attempt int) ([]byte, error) {
+		return d.downloadBody(ctx, rawURL, attempt, mediaDownloadAttempts)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -186,20 +198,26 @@ func (d Downloader) fetchMetadata(ctx context.Context, rawURL string) (ytDLPMeta
 	cmd := exec.CommandContext(ctx, d.executable(), d.metadataArgs(rawURL)...)
 	cmd.Stderr = &stderr
 
+	started := time.Now()
 	output, err := cmd.Output()
 	if err != nil {
-		return ytDLPMetadata{}, commandError("yt-dlp metadata", err, stderr.String(), ctx.Err())
+		logErr := commandError("yt-dlp metadata", err, stderr.String(), ctx.Err())
+		d.logYTDLPError("yt-dlp command failed", rawURL, "metadata", "error", 1, 1, stderr.String(), time.Since(started), logErr)
+		return ytDLPMetadata{}, logErr
 	}
 
 	var metadata ytDLPMetadata
 	if err := json.Unmarshal(output, &metadata); err != nil {
-		return ytDLPMetadata{}, fmt.Errorf("parse yt-dlp metadata: %w", err)
+		logErr := fmt.Errorf("parse yt-dlp metadata: %w", err)
+		d.logYTDLPError("yt-dlp command failed", rawURL, "metadata", "error", 1, 1, stderr.String(), time.Since(started), logErr)
+		return ytDLPMetadata{}, logErr
 	}
 
+	d.logYTDLPMetadataSuccess(rawURL, metadata, stderr.String(), time.Since(started))
 	return metadata, nil
 }
 
-func (d Downloader) downloadBody(ctx context.Context, rawURL string) ([]byte, error) {
+func (d Downloader) downloadBody(ctx context.Context, rawURL string, attempt int, maxAttempts int) ([]byte, error) {
 	childCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -214,8 +232,11 @@ func (d Downloader) downloadBody(ctx context.Context, rawURL string) ([]byte, er
 		return nil, fmt.Errorf("open yt-dlp stderr: %w", err)
 	}
 
+	started := time.Now()
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("start yt-dlp download: %w", err)
+		logErr := fmt.Errorf("start yt-dlp download: %w", err)
+		d.logYTDLPError("yt-dlp command failed", rawURL, "download", "error", attempt, maxAttempts, "", time.Since(started), logErr)
+		return nil, logErr
 	}
 
 	var stderrBuf cappedBuffer
@@ -238,15 +259,51 @@ func (d Downloader) downloadBody(ctx context.Context, rawURL string) ([]byte, er
 
 	if readErr != nil {
 		if errors.Is(readErr, ErrDownloadTooLarge) {
-			return nil, fmt.Errorf("%w: limit=%d stderr=%q", ErrDownloadTooLarge, d.MaxBytes, stderrBuf.String())
+			logErr := fmt.Errorf("%w: limit=%d stderr=%q", ErrDownloadTooLarge, d.MaxBytes, sanitizeCommandText(stderrBuf.String()))
+			d.logYTDLPError("yt-dlp command failed", rawURL, "download", "too_large", attempt, maxAttempts, stderrBuf.String(), time.Since(started), logErr)
+			return nil, logErr
 		}
-		return nil, fmt.Errorf("read yt-dlp stdout: %w", readErr)
+		logErr := fmt.Errorf("read yt-dlp stdout: %w", readErr)
+		d.logYTDLPError("yt-dlp command failed", rawURL, "download", "error", attempt, maxAttempts, stderrBuf.String(), time.Since(started), logErr)
+		return nil, logErr
 	}
 	if waitErr != nil {
-		return nil, commandError("yt-dlp download", waitErr, stderrBuf.String(), ctx.Err())
+		logErr := commandError("yt-dlp download", waitErr, stderrBuf.String(), ctx.Err())
+		d.logYTDLPError("yt-dlp command failed", rawURL, "download", "error", attempt, maxAttempts, stderrBuf.String(), time.Since(started), logErr)
+		return nil, logErr
+	}
+	if len(body) == 0 {
+		logErr := fmt.Errorf("%w: yt-dlp stdout was empty stderr=%q", ErrEmptyDownloadedMedia, sanitizeCommandText(stderrBuf.String()))
+		d.logYTDLPError("yt-dlp command failed", rawURL, "download", "empty_stdout", attempt, maxAttempts, stderrBuf.String(), time.Since(started), logErr)
+		return nil, logErr
 	}
 
+	d.logYTDLPDownloadSuccess(rawURL, len(body), stderrBuf.String(), attempt, maxAttempts, time.Since(started))
 	return body, nil
+}
+
+func retryByteOperation(ctx context.Context, attempts int, operation string, fn func(attempt int) ([]byte, error)) ([]byte, error) {
+	if attempts <= 0 {
+		attempts = 1
+	}
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		body, err := fn(attempt)
+		if err == nil && len(body) == 0 {
+			err = fmt.Errorf("%w: %s returned no bytes", ErrEmptyDownloadedMedia, operation)
+		}
+		if err == nil {
+			return body, nil
+		}
+		lastErr = err
+		if ctx.Err() != nil {
+			return nil, err
+		}
+		if !errors.Is(err, ErrEmptyDownloadedMedia) {
+			return nil, err
+		}
+	}
+	return nil, fmt.Errorf("%s failed after %d attempts: %w", operation, attempts, lastErr)
 }
 
 func (d Downloader) executable() string {
@@ -293,8 +350,8 @@ func baseArgs() []string {
 
 func formatArgs() []string {
 	return []string{
-		"--format", "b[ext=mp4][vcodec!=none][acodec!=none][filesize<48M]/b[ext=mp4][vcodec!=none][acodec!=none][filesize_approx<48M]/b[ext=mp4][vcodec!=none][acodec!=none]/1/b[ext=mp4]/best[ext=mp4]/best",
-		"--format-sort", "size:48M,res:720,+codec:avc:m4a",
+		"--format", "b[ext=mp4][vcodec!=none][acodec!=none][filesize<96M]/b[ext=mp4][vcodec!=none][acodec!=none][filesize_approx<96M]/b[ext=mp4][vcodec!=none][acodec!=none]/1/b[ext=mp4]/best[ext=mp4]/best",
+		"--format-sort", "size:96M,res:720,+codec:avc:m4a",
 	}
 }
 
@@ -334,10 +391,98 @@ func readBounded(src io.Reader, maxBytes int64) ([]byte, error) {
 }
 
 func commandError(op string, err error, stderr string, ctxErr error) error {
+	stderr = sanitizeCommandText(stderr)
 	if ctxErr != nil {
 		return fmt.Errorf("%s: %w: stderr=%q", op, ctxErr, stderr)
 	}
 	return fmt.Errorf("%s: %w: stderr=%q", op, err, stderr)
+}
+
+func (d Downloader) logYTDLPMetadataSuccess(rawURL string, metadata ytDLPMetadata, _ string, duration time.Duration) {
+	if d.Logger == nil {
+		return
+	}
+	fields := d.ytDLPLogFields(rawURL, "metadata", "success", 1, 1, duration)
+	fields = append(fields,
+		"yt_dlp_id", metadata.ID,
+		"yt_dlp_format_id", metadata.FormatID,
+		"yt_dlp_ext", metadata.Ext,
+		"yt_dlp_vcodec", metadata.VCodec,
+		"yt_dlp_acodec", metadata.ACodec,
+		"yt_dlp_duration", metadata.Duration,
+		"yt_dlp_width", metadata.Width,
+		"yt_dlp_height", metadata.Height,
+		"yt_dlp_filesize", metadata.Filesize,
+		"yt_dlp_filesize_approx", metadata.FilesizeApprox,
+	)
+	d.Logger.Info("yt-dlp metadata fetched", fields...)
+}
+
+func (d Downloader) logYTDLPDownloadSuccess(rawURL string, bytes int, _ string, attempt int, maxAttempts int, duration time.Duration) {
+	if d.Logger == nil {
+		return
+	}
+	fields := d.ytDLPLogFields(rawURL, "download", "success", attempt, maxAttempts, duration)
+	fields = append(fields,
+		"bytes", bytes,
+		"filename", defaultOutputFilename,
+		"mime", defaultOutputMIME,
+	)
+	d.Logger.Info("yt-dlp download completed", fields...)
+}
+
+func (d Downloader) logYTDLPError(message string, rawURL string, operation string, status string, attempt int, maxAttempts int, stderr string, duration time.Duration, err error) {
+	if d.Logger == nil {
+		return
+	}
+	fields := d.ytDLPLogFields(rawURL, operation, status, attempt, maxAttempts, duration)
+	fields = append(fields,
+		"error", err,
+		"yt_dlp_stderr", sanitizeCommandText(stderr),
+	)
+	d.Logger.Error(message, fields...)
+}
+
+func (d Downloader) ytDLPLogFields(rawURL string, operation string, status string, attempt int, maxAttempts int, duration time.Duration) []any {
+	fields := []any{
+		"yt_dlp_operation", operation,
+		"status", status,
+		"attempt", attempt,
+		"max_attempts", maxAttempts,
+		"duration_ms", duration.Milliseconds(),
+	}
+	if host, path := commandURLParts(rawURL); host != "" {
+		fields = append(fields, "url_host", host, "url_path", path)
+	}
+	return fields
+}
+
+func commandURLParts(rawURL string) (string, string) {
+	value := rawURL
+	if !strings.Contains(value, "://") {
+		value = "https://" + value
+	}
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return "", ""
+	}
+	return parsed.Hostname(), parsed.EscapedPath()
+}
+
+func sanitizeCommandText(value string) string {
+	if value == "" {
+		return ""
+	}
+	value = telegramTokenPattern.ReplaceAllString(value, "bot<TOKEN>")
+	return commandURLPattern.ReplaceAllStringFunc(value, func(match string) string {
+		parsed, err := url.Parse(match)
+		if err != nil || parsed.Host == "" {
+			return match
+		}
+		parsed.RawQuery = ""
+		parsed.Fragment = ""
+		return parsed.String()
+	})
 }
 
 func isInstagramPhotoPostFallback(rawURL string, err error) bool {
@@ -416,10 +561,17 @@ func tikTokURLPath(rawURL string, fallback string) string {
 }
 
 type ytDLPMetadata struct {
-	Title    string  `json:"title"`
-	Duration float64 `json:"duration"`
-	Width    int     `json:"width"`
-	Height   int     `json:"height"`
+	ID             string  `json:"id"`
+	Title          string  `json:"title"`
+	FormatID       string  `json:"format_id"`
+	Ext            string  `json:"ext"`
+	VCodec         string  `json:"vcodec"`
+	ACodec         string  `json:"acodec"`
+	Duration       float64 `json:"duration"`
+	Width          int     `json:"width"`
+	Height         int     `json:"height"`
+	Filesize       int64   `json:"filesize"`
+	FilesizeApprox int64   `json:"filesize_approx"`
 }
 
 type tikTokPhotoAPIResponse struct {
@@ -554,7 +706,7 @@ func (d Downloader) downloadInstagramPhotoPost(ctx context.Context, rawURL strin
 	duration := audioSelection.effectiveDuration()
 	videoImages := downloadedMediaBytes(photos)
 	videoDuration := slideshowVideoDuration(duration, len(videoImages))
-	video, err := d.synthesizeSlideshowVideo(ctx, videoImages, audio, audioSelection.StartOffset, duration, "instagram")
+	video, err := d.synthesizeSlideshowVideoWithRetries(ctx, videoImages, audio, audioSelection.StartOffset, duration, "instagram")
 	if err != nil {
 		return nil, err
 	}
@@ -628,7 +780,7 @@ func (d Downloader) downloadTikTokPhotoPost(ctx context.Context, rawURL string) 
 	duration := audioSelection.effectiveDuration()
 	videoImages := downloadedMediaBytes(photos)
 	videoDuration := slideshowVideoDuration(duration, len(videoImages))
-	video, err := d.synthesizeSlideshowVideo(ctx, videoImages, audio, audioSelection.StartOffset, duration, "tiktok")
+	video, err := d.synthesizeSlideshowVideoWithRetries(ctx, videoImages, audio, audioSelection.StartOffset, duration, "tiktok")
 	if err != nil {
 		return nil, err
 	}
@@ -1158,7 +1310,13 @@ func (d Downloader) addInstagramCookies(req *http.Request) error {
 }
 
 func (d Downloader) synthesizeVideo(ctx context.Context, image []byte, audio []byte, audioStart time.Duration, duration time.Duration) ([]byte, error) {
-	return d.synthesizeSlideshowVideo(ctx, [][]byte{image}, audio, audioStart, duration, "unknown")
+	return d.synthesizeSlideshowVideoWithRetries(ctx, [][]byte{image}, audio, audioStart, duration, "unknown")
+}
+
+func (d Downloader) synthesizeSlideshowVideoWithRetries(ctx context.Context, images [][]byte, audio []byte, audioStart time.Duration, audioDuration time.Duration, platform string) ([]byte, error) {
+	return retryByteOperation(ctx, mediaDownloadAttempts, "ffmpeg synthesize", func(int) ([]byte, error) {
+		return d.synthesizeSlideshowVideo(ctx, images, audio, audioStart, audioDuration, platform)
+	})
 }
 
 func (d Downloader) synthesizeSlideshowVideo(ctx context.Context, images [][]byte, audio []byte, audioStart time.Duration, audioDuration time.Duration, platform string) ([]byte, error) {
@@ -1247,6 +1405,9 @@ func (d Downloader) synthesizeSlideshowVideo(ctx context.Context, images [][]byt
 	body, err := readBounded(file, d.MaxBytes)
 	if err != nil {
 		return nil, err
+	}
+	if len(body) == 0 {
+		return nil, fmt.Errorf("%w: ffmpeg output was empty", ErrEmptyDownloadedMedia)
 	}
 	return body, nil
 }

@@ -395,6 +395,110 @@ func TestInlineHandlerBackgroundJobUploadsMultipleMediaAndAnswersOnlyCachedVideo
 	}
 }
 
+func TestInlineHandlerUploadsPlainPhotoButDoesNotCacheIt(t *testing.T) {
+	service := &fakeReelsService{
+		media: []Media{{
+			Kind:     MediaKindPhoto,
+			Filename: "photo.jpg",
+			Bytes:    []byte("original photo bytes"),
+		}},
+	}
+	telegram := &fakeTelegramClient{photoFileID: "telegram-photo-id"}
+	runner := &capturedRunner{}
+	cache := NewMediaCache(defaultMediaCacheTTL)
+	handler := InlineHandler{
+		Service:       service,
+		Telegram:      telegram,
+		Cache:         cache,
+		StorageChatID: -100123,
+		RunBackground: runner.run,
+	}
+
+	const reelURL = "https://www.instagram.com/p/plainphoto/"
+	if err := handler.Handle(context.Background(), InlineQuery{ID: "inline-photo", Query: reelURL}); err != nil {
+		t.Fatalf("Handle() error = %v", err)
+	}
+	runner.runNext(t)
+
+	if len(telegram.photoUploads) != 1 {
+		t.Fatalf("photo uploads = %d, want 1", len(telegram.photoUploads))
+	}
+	if string(telegram.photoUploads[0].media.Bytes) != "original photo bytes" {
+		t.Fatalf("uploaded photo bytes = %q", telegram.photoUploads[0].media.Bytes)
+	}
+	if len(telegram.videoUploads) != 0 {
+		t.Fatalf("video uploads = %d, want 0", len(telegram.videoUploads))
+	}
+	if stats := cache.Stats(); stats.Entries != 0 {
+		t.Fatalf("cache entries = %d, want 0 for photo-only result", stats.Entries)
+	}
+
+	if err := handler.Handle(context.Background(), InlineQuery{ID: "inline-photo-again", Query: reelURL}); err != nil {
+		t.Fatalf("Handle(second) error = %v", err)
+	}
+	if len(runner.tasks) != 1 {
+		t.Fatalf("background tasks after repeated photo query = %d, want 1", len(runner.tasks))
+	}
+}
+
+func TestInlineHandlerRejectsEmptyMediaItemBeforeUpload(t *testing.T) {
+	service := &fakeReelsService{
+		media: []Media{{
+			Kind:     MediaKindVideo,
+			Filename: "reel.mp4",
+		}},
+	}
+	telegram := &fakeTelegramClient{videoFileID: "telegram-file-id"}
+	logger := &fakeLogger{}
+	metrics := &fakeMetricsRecorder{}
+	runner := &capturedRunner{}
+	cache := NewMediaCache(defaultMediaCacheTTL)
+	handler := InlineHandler{
+		Service:       service,
+		Telegram:      telegram,
+		Logger:        logger,
+		Cache:         cache,
+		StorageChatID: -100123,
+		RunBackground: runner.run,
+		Metrics:       metrics,
+	}
+
+	const reelURL = "https://www.instagram.com/reel/empty/"
+	if err := handler.Handle(context.Background(), InlineQuery{ID: "inline-empty", Query: reelURL}); err != nil {
+		t.Fatalf("Handle() error = %v", err)
+	}
+	if err := handler.HandleChosen(context.Background(), ChosenInlineResult{
+		ResultID:        "preparing",
+		Query:           reelURL,
+		InlineMessageID: "inline-message-empty",
+	}); err != nil {
+		t.Fatalf("HandleChosen() error = %v", err)
+	}
+	runner.runNext(t)
+
+	if len(telegram.videoUploads) != 0 || len(telegram.photoUploads) != 0 {
+		t.Fatalf("uploads = videos:%v photos:%v, want none", telegram.videoUploads, telegram.photoUploads)
+	}
+	if stats := cache.Stats(); stats.Entries != 0 {
+		t.Fatalf("cache entries = %d, want 0", stats.Entries)
+	}
+	if len(telegram.textEdits) != 1 || telegram.textEdits[0].text != "Could not download this media." {
+		t.Fatalf("text edits = %#v, want download failure edit", telegram.textEdits)
+	}
+	if got, want := metrics.downloads, []downloadMetric{{platform: "instagram", status: "empty_media"}}; len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("download metrics = %#v, want %#v", got, want)
+	}
+	if len(metrics.downloadSizes) != 0 || len(metrics.uploadSizes) != 0 || len(metrics.uploads) != 0 {
+		t.Fatalf("metrics recorded for empty media: downloadSizes=%#v uploadSizes=%#v uploads=%#v", metrics.downloadSizes, metrics.uploadSizes, metrics.uploads)
+	}
+	if len(logger.errorMessages) != 1 || logger.errorMessages[0] != "download inline media returned empty item" {
+		t.Fatalf("logger messages = %v", logger.errorMessages)
+	}
+	if !fieldsContain(logger.errorFields[0], "kind", MediaKindVideo) || !fieldsContain(logger.errorFields[0], "bytes", 0) {
+		t.Fatalf("logger fields = %#v", logger.errorFields[0])
+	}
+}
+
 func TestInlineHandlerUsesCachedMediaForRepeatedURL(t *testing.T) {
 	service := &fakeReelsService{
 		media: []Media{{
@@ -893,7 +997,7 @@ func TestInlineHandlerUsesRegisteredUserStorageChat(t *testing.T) {
 	}
 }
 
-func fieldsContain(fields []any, key string, value string) bool {
+func fieldsContain(fields []any, key string, value any) bool {
 	for i := 0; i+1 < len(fields); i += 2 {
 		if fields[i] == key && fields[i+1] == value {
 			return true

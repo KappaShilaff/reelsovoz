@@ -47,6 +47,8 @@ type MetricsRecorder interface {
 	IncInlineMediaSent(kind string, source string, status string)
 }
 
+var errEmptyMediaItem = errors.New("empty media item")
+
 type InlineQuery struct {
 	ID         string
 	Query      string
@@ -196,17 +198,27 @@ func (h InlineHandler) prepareInlineMedia(reelURL string, cacheKey string, stora
 	platform := sourcePlatform(reelURL)
 	downloadStarted := time.Now()
 	media, err := h.Service.Download(ctx, reelURL)
-	h.recordDownload(platform, statusFromError(ctx, err), time.Since(downloadStarted))
+	downloadDuration := time.Since(downloadStarted)
 	if err != nil {
+		h.recordDownload(platform, statusFromError(ctx, err), downloadDuration)
 		h.logError("download inline media failed", err, reelURL)
 		h.editPendingInlineMessages(ctx, cacheKey, nil, "Could not download this media.")
 		return
 	}
 	if len(media) == 0 {
+		h.recordDownload(platform, "empty_media", downloadDuration)
 		h.logError("download inline media returned no supported media", fmt.Errorf("empty media result"), reelURL)
 		h.editPendingInlineMessages(ctx, cacheKey, nil, "This reel has no supported media.")
 		return
 	}
+	if err := validateMediaItems(media); err != nil {
+		h.recordDownload(platform, statusFromError(ctx, err), downloadDuration)
+		index, kind, bytes := emptyMediaItemFields(media)
+		h.logError("download inline media returned empty item", err, reelURL, "kind", kind, "index", index, "bytes", bytes)
+		h.editPendingInlineMessages(ctx, cacheKey, nil, "Could not download this media.")
+		return
+	}
+	h.recordDownload(platform, "success", downloadDuration)
 
 	for _, item := range media {
 		h.recordDownloadedMedia(platform, string(item.Kind), len(item.Bytes))
@@ -216,7 +228,7 @@ func (h InlineHandler) prepareInlineMedia(reelURL string, cacheKey string, stora
 	for i, item := range media {
 		cachedItem, _, err := h.uploadAndBuildResult(ctx, reelURL, i, item, storageChatID)
 		if err != nil {
-			h.logError("upload inline media failed", err, reelURL, "kind", item.Kind, "index", i)
+			h.logError("upload inline media failed", err, reelURL, "kind", item.Kind, "index", i, "bytes", len(item.Bytes))
 			h.editPendingInlineMessages(ctx, cacheKey, nil, "Could not upload this media.")
 			return
 		}
@@ -251,6 +263,24 @@ func (h InlineHandler) editInlineMessageToCachedMedia(ctx context.Context, inlin
 		return h.Telegram.EditInlineMessageText(ctx, inlineMessageID, "This reel has no supported media.")
 	}
 	return h.Telegram.EditInlineMessageMedia(ctx, inlineMessageID, media[0])
+}
+
+func validateMediaItems(media []Media) error {
+	for i, item := range media {
+		if len(item.Bytes) == 0 {
+			return fmt.Errorf("%w: index=%d kind=%s", errEmptyMediaItem, i, item.Kind)
+		}
+	}
+	return nil
+}
+
+func emptyMediaItemFields(media []Media) (int, MediaKind, int) {
+	for i, item := range media {
+		if len(item.Bytes) == 0 {
+			return i, item.Kind, len(item.Bytes)
+		}
+	}
+	return -1, "", 0
 }
 
 func (h InlineHandler) prepareTimeout() time.Duration {
@@ -292,6 +322,9 @@ func (h InlineHandler) logInfo(message string, rawURL string, args ...any) {
 }
 
 func (h InlineHandler) uploadAndBuildResult(ctx context.Context, reelURL string, index int, media Media, storageChatID int64) (CachedMedia, gotgbot.InlineQueryResult, error) {
+	if len(media.Bytes) == 0 {
+		return CachedMedia{}, nil, fmt.Errorf("%w: index=%d kind=%s", errEmptyMediaItem, index, media.Kind)
+	}
 	caption := sourceCaption(reelURL)
 	media.Caption = caption
 	cached := CachedMedia{
@@ -610,6 +643,9 @@ func sourcePlatform(raw string) string {
 func statusFromError(ctx context.Context, err error) string {
 	if err == nil {
 		return "success"
+	}
+	if errors.Is(err, reels.ErrEmptyDownloadedMedia) || errors.Is(err, errEmptyMediaItem) {
+		return "empty_media"
 	}
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return "timeout"

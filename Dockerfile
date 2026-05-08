@@ -29,7 +29,7 @@ ENV USER_STORAGE_FILE=/data/reelsovoz-users.json \
     PREPARE_TIMEOUT=10m \
     TELEGRAM_UPLOAD_RETRIES=3 \
     TELEGRAM_UPLOAD_TIMEOUT=120s \
-    MAX_VIDEO_BYTES=50331648 \
+    MAX_VIDEO_BYTES=100663296 \
     HEALTH_ADDR=:8000
 
 COPY --from=builder /out/application /app/application
